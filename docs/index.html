@@ -290,7 +290,6 @@
     <a href="#cas">🧩 CAS Framework</a>
     <a href="#samples">🎧 Audio Samples</a>
     <a href="#model">🤖 Model</a>
-    <a href="#citation">📋 Citation</a>
   </div>
 </header>
 
@@ -574,22 +573,6 @@
       <img src="images/harper_architecture.png" alt="HARPER Architecture" style="max-width:100%;" />
       <div class="caption">Figure: HARPER architecture. Audio is processed through original spectral features and a NAC probe bank, projected into acoustic tokens, routed via hyperbolic evidence routing, fused across components, and decoded by a language model to produce a joint CAS prediction.</div>
     </div>
-    <div class="figure-wrap">
-      <img src="images/idempotence_histogram.png" alt="Idempotence Histogram" style="max-width:100%;" />
-      <div class="caption">Figure: Idempotence validation — distribution of ‖x − C(x)‖<sub>mel</sub> for bona fide clips (coloured) vs. codec-generated clips (grey). Codec-generated audio is near-idempotent under its own codec (small residual), while genuine audio is substantially distorted — justifying the use of a NAC probe bank.</div>
-    </div>
-  </section>
-
-  <!-- Citation -->
-  <section id="citation">
-    <h2><span class="icon">📋</span>Citation</h2>
-    <div class="citation-box" id="bibtex">@inproceedings{harper2026,
-  title     = {Rethinking Audio Spoofing: When Authenticity Becomes Compositional},
-  booktitle = {Proceedings of the 64th Annual Meeting of the
-               Association for Computational Linguistics (ACL)},
-  year      = {2026},
-  note      = {Under review — anonymous submission}
-}<button class="copy-btn" onclick="copyBib()">Copy</button></div>
   </section>
 
 </main>
@@ -598,15 +581,5 @@
   Anonymous submission · ACL 2026 · Audio samples from public corpora; see paper for details.
 </footer>
 
-<script>
-function copyBib() {
-  const text = document.getElementById('bibtex').innerText.replace('Copy','').trim();
-  navigator.clipboard.writeText(text).then(() => {
-    const btn = document.querySelector('.copy-btn');
-    btn.textContent = 'Copied!';
-    setTimeout(() => btn.textContent = 'Copy', 1800);
-  });
-}
-</script>
 </body>
 </html>
