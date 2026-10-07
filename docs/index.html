@@ -289,7 +289,6 @@
     <a href="#abstract">📄 Abstract</a>
     <a href="#cas">🧩 CAS Framework</a>
     <a href="#samples">🎧 Audio Samples</a>
-    <a href="#model">🤖 Model</a>
     <a href="#citation">📋 Citation</a>
   </div>
 </header>
@@ -528,7 +527,7 @@
   <section id="dataset">
     <h2><span class="icon">🗂️</span>Dataset — SAS-CF</h2>
     <p class="cas-intro" style="margin-bottom:20px;">
-      SAS-CF is constructed from the following public corpora and augmented using 19 neural audio codecs. No download links are provided during the review period.
+      SAS-CF is constructed from the following public corpora and augmented using 19 neural audio codecs. The full dataset will be released on <strong>HuggingFace</strong> upon paper acceptance.
     </p>
     <div class="source-grid">
       <div class="source-card">
@@ -561,22 +560,6 @@
         <div class="src-name">SAS-CF Mix</div>
         <div class="src-detail">1.8M+ clips across 8 CAS states</div>
       </div>
-    </div>
-  </section>
-
-  <!-- Model -->
-  <section id="model">
-    <h2><span class="icon">🤖</span>HARPER — Model Overview</h2>
-    <p class="cas-intro" style="margin-bottom:20px;">
-      HARPER (Hierarchical Audio Reasoning with Probe-Enhanced Representations) combines <strong>neural codec probing</strong>, <strong>hyperbolic product-space CAS reasoning</strong>, and a <strong>generative audio language model</strong> (Qwen2-0.5B) to jointly predict both speech and environmental authenticity.
-    </p>
-    <div class="figure-wrap" style="margin-bottom:20px;">
-      <img src="images/per_cond_acc.png" alt="Per-condition Joint Accuracy" style="max-width:700px;" />
-      <div class="caption">Figure: Joint accuracy (both components correct) across all 8 CAS conditions on SAS-CF.</div>
-    </div>
-    <div class="figure-wrap">
-      <img src="images/confusion_matrix.png" alt="CAS Confusion Matrix" style="max-width:580px;" />
-      <div class="caption">Figure: Row-normalised confusion matrix over 8 CAS states. Hardest conditions: M<sub>rf</sub> ↔ M<sub>fr</sub> mirror confusion.</div>
     </div>
   </section>
 
