@@ -289,6 +289,7 @@
     <a href="#abstract">📄 Abstract</a>
     <a href="#cas">🧩 CAS Framework</a>
     <a href="#samples">🎧 Audio Samples</a>
+    <a href="#model">🤖 Model</a>
     <a href="#citation">📋 Citation</a>
   </div>
 </header>
@@ -560,6 +561,18 @@
         <div class="src-name">SAS-CF Mix</div>
         <div class="src-detail">1.8M+ clips across 8 CAS states</div>
       </div>
+    </div>
+  </section>
+
+  <!-- Model -->
+  <section id="model">
+    <h2><span class="icon">🤖</span>HARPER — Model Overview</h2>
+    <p class="cas-intro" style="margin-bottom:20px;">
+      HARPER (Hierarchical Audio Reasoning with Probe-Enhanced Representations) combines <strong>neural codec probing</strong>, <strong>hyperbolic product-space CAS reasoning</strong>, and a <strong>generative audio language model</strong> (Qwen2-0.5B) to jointly predict both speech and environmental authenticity.
+    </p>
+    <div class="figure-wrap">
+      <img src="images/harper_architecture.png" alt="HARPER Architecture" style="max-width:100%;" />
+      <div class="caption">Figure: HARPER architecture. Audio is processed through original spectral features and a NAC probe bank, projected into acoustic tokens, routed via hyperbolic evidence routing, fused across components, and decoded by a language model to produce a joint CAS prediction.</div>
     </div>
   </section>
 
