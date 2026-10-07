@@ -570,9 +570,13 @@
     <p class="cas-intro" style="margin-bottom:20px;">
       HARPER (Hierarchical Audio Reasoning with Probe-Enhanced Representations) combines <strong>neural codec probing</strong>, <strong>hyperbolic product-space CAS reasoning</strong>, and a <strong>generative audio language model</strong> (Qwen2-0.5B) to jointly predict both speech and environmental authenticity.
     </p>
-    <div class="figure-wrap">
+    <div class="figure-wrap" style="margin-bottom:20px;">
       <img src="images/harper_architecture.png" alt="HARPER Architecture" style="max-width:100%;" />
       <div class="caption">Figure: HARPER architecture. Audio is processed through original spectral features and a NAC probe bank, projected into acoustic tokens, routed via hyperbolic evidence routing, fused across components, and decoded by a language model to produce a joint CAS prediction.</div>
+    </div>
+    <div class="figure-wrap">
+      <img src="images/idempotence_histogram.png" alt="Idempotence Histogram" style="max-width:100%;" />
+      <div class="caption">Figure: Idempotence validation — distribution of ‖x − C(x)‖<sub>mel</sub> for bona fide clips (coloured) vs. codec-generated clips (grey). Codec-generated audio is near-idempotent under its own codec (small residual), while genuine audio is substantially distorted — justifying the use of a NAC probe bank.</div>
     </div>
   </section>
 
