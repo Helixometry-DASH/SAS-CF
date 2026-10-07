@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rethinking Audio Spoofing: When Authenticity Becomes Compositional</title>
+  <style>
+    :root {
+      --primary: #1a1a2e;
+      --accent:  #4f8ef7;
+      --accent2: #7c5cbf;
+      --bg:      #f8f9fc;
+      --card:    #ffffff;
+      --border:  #e2e8f0;
+      --text:    #1e293b;
+      --muted:   #64748b;
+      --real-col:#16a34a;
+      --fake-col:#dc2626;
+      --tag-r:   #dcfce7;
+      --tag-f:   #fee2e2;
+      --tag-a:   #e0f2fe;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+    }
+
+    /* ── Header ── */
+    header {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 60%, #0f3460 100%);
+      color: white;
+      padding: 60px 24px 50px;
+      text-align: center;
+    }
+    header .venue-badge {
+      display: inline-block;
+      background: rgba(79,142,247,0.25);
+      border: 1px solid rgba(79,142,247,0.5);
+      color: #93c5fd;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 4px 14px;
+      border-radius: 20px;
+      margin-bottom: 20px;
+      letter-spacing: 0.04em;
+    }
+    header h1 {
+      font-size: clamp(22px, 3.5vw, 36px);
+      font-weight: 700;
+      line-height: 1.3;
+      max-width: 860px;
+      margin: 0 auto 28px;
+    }
+    .nav-links {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .nav-links a {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.25);
+      color: white;
+      text-decoration: none;
+      padding: 8px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      transition: background 0.2s;
+    }
+    .nav-links a:hover { background: rgba(255,255,255,0.2); }
+
+    /* ── Layout ── */
+    main { max-width: 960px; margin: 0 auto; padding: 48px 24px 80px; }
+    section { margin-bottom: 56px; }
+    h2 {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--primary);
+      padding-bottom: 10px;
+      border-bottom: 2px solid var(--border);
+      margin-bottom: 24px;
+    }
+    h2 .icon { margin-right: 8px; }
+
+    /* ── Abstract ── */
+    .abstract-box {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      border-radius: 10px;
+      padding: 24px 28px;
+      font-size: 15.5px;
+      color: var(--text);
+    }
+
+    /* ── CAS Grid ── */
+    .cas-intro {
+      font-size: 15px;
+      color: var(--muted);
+      margin-bottom: 20px;
+    }
+    .cas-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 14px;
+      margin-bottom: 12px;
+    }
+    .cas-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      text-align: center;
+    }
+    .cas-card .label {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--primary);
+      font-family: "Georgia", serif;
+    }
+    .cas-card .desc { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .tag {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 12px;
+      margin-top: 6px;
+    }
+    .tag-r  { background: var(--tag-r); color: #15803d; }
+    .tag-f  { background: var(--tag-f); color: #b91c1c; }
+    .tag-a  { background: var(--tag-a); color: #0369a1; }
+
+    /* ── Samples Table ── */
+    .cond-block { margin-bottom: 40px; }
+    .cond-header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 14px;
+      padding: 14px 18px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .cond-name {
+      font-size: 20px;
+      font-weight: 700;
+      font-family: "Georgia", serif;
+      color: var(--primary);
+      min-width: 56px;
+    }
+    .cond-desc { font-size: 14px; color: var(--muted); }
+    .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+    .badge-speech-r { background:#dcfce7; color:#15803d; }
+    .badge-speech-f { background:#fee2e2; color:#b91c1c; }
+    .badge-env-r    { background:#dbeafe; color:#1d4ed8; }
+    .badge-env-f    { background:#fef3c7; color:#b45309; }
+    .badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 12px;
+    }
+
+    .samples-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+    .sample-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }
+    .sample-card .sample-num {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+    .sample-card audio {
+      width: 100%;
+      height: 36px;
+    }
+    /* Style native audio */
+    audio { accent-color: var(--accent); }
+
+    /* ── Overview figure ── */
+    .figure-wrap {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+      text-align: center;
+    }
+    .figure-wrap img {
+      max-width: 100%;
+      border-radius: 6px;
+    }
+    .figure-wrap .caption {
+      font-size: 13px;
+      color: var(--muted);
+      margin-top: 12px;
+    }
+
+    /* ── Dataset sources ── */
+    .source-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 14px;
+    }
+    .source-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 18px;
+    }
+    .source-card .src-type {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--accent2);
+      margin-bottom: 4px;
+    }
+    .source-card .src-name { font-size: 15px; font-weight: 600; }
+    .source-card .src-detail { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+    /* ── Citation ── */
+    .citation-box {
+      background: #1e293b;
+      color: #e2e8f0;
+      border-radius: 10px;
+      padding: 22px 24px;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.7;
+      white-space: pre-wrap;
+      word-break: break-all;
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute;
+      top: 14px; right: 14px;
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.2);
+      color: #cbd5e1;
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .copy-btn:hover { background: rgba(255,255,255,0.2); }
+
+    footer {
+      text-align: center;
+      padding: 24px;
+      font-size: 13px;
+      color: var(--muted);
+      border-top: 1px solid var(--border);
+    }
+
+    @media (max-width: 640px) {
+      .samples-row { grid-template-columns: 1fr; }
+      .cas-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ══ HEADER ══════════════════════════════════════════════════════════ -->
+<header>
+  <div class="venue-badge">ACL 2026 · Under Review</div>
+  <h1>Rethinking Audio Spoofing:<br>When Authenticity Becomes Compositional</h1>
+  <div class="nav-links">
+    <a href="#abstract">📄 Abstract</a>
+    <a href="#cas">🧩 CAS Framework</a>
+    <a href="#samples">🎧 Audio Samples</a>
+    <a href="#model">🤖 Model</a>
+    <a href="#citation">📋 Citation</a>
+  </div>
+</header>
+
+<!-- ══ MAIN ═════════════════════════════════════════════════════════════ -->
+<main>
+
+  <!-- Abstract -->
+  <section id="abstract">
+    <h2><span class="icon">📄</span>Abstract</h2>
+    <div class="abstract-box">
+      Existing audio spoofing detection systems treat authenticity as a binary property — an utterance is either genuine or fake. We challenge this assumption by introducing the <strong>Compositional Authenticity Space (CAS)</strong>, a framework that models speech and environmental audio independently along a three-way axis: Absent (A), Real (R), or Fake (F). This yields eight distinct compositional states ranging from fully authentic scenes to mixed conditions where only one component has been synthesised. We present <strong>SAS-CF</strong>, a large-scale dataset of over 1.8M clips spanning these eight states, constructed from real-world speech corpora, environmental sound datasets, and 19 neural audio codecs. We further introduce <strong>HARPER</strong> (Hierarchical Audio Reasoning with Probe-Enhanced Representations), a model that combines neural codec probing, hyperbolic product-space reasoning, and a generative audio language model to jointly predict both speech and environmental authenticity. HARPER achieves strong performance on in-domain and unseen-codec evaluation while running at an RTF of 0.0265 — over 11× faster than prior state-of-the-art systems.
+    </div>
+  </section>
+
+  <!-- CAS Framework -->
+  <section id="cas">
+    <h2><span class="icon">🧩</span>Compositional Authenticity Space (CAS)</h2>
+    <p class="cas-intro">
+      We model each audio scene as a pair (y<sub>s</sub>, y<sub>e</sub>) where y<sub>s</sub> ∈ {A, R, F} describes the speech component and y<sub>e</sub> ∈ {A, R, F} describes the environmental sound. Excluding the trivial (A, A) case gives <strong>8 valid compositional states</strong>:
+    </p>
+    <div class="cas-grid">
+      <div class="cas-card">
+        <div class="label">s<sub>r</sub></div>
+        <div class="desc">Speech only — Real</div>
+        <span class="tag tag-r">Speech Real</span>
+        <span class="tag tag-a">Env Absent</span>
+      </div>
+      <div class="cas-card">
+        <div class="label">s<sub>f</sub></div>
+        <div class="desc">Speech only — Fake</div>
+        <span class="tag tag-f">Speech Fake</span>
+        <span class="tag tag-a">Env Absent</span>
+      </div>
+      <div class="cas-card">
+        <div class="label">e<sub>r</sub></div>
+        <div class="desc">Environment only — Real</div>
+        <span class="tag tag-a">Speech Absent</span>
+        <span class="tag tag-r">Env Real</span>
+      </div>
+      <div class="cas-card">
+        <div class="label">e<sub>f</sub></div>
+        <div class="desc">Environment only — Fake</div>
+        <span class="tag tag-a">Speech Absent</span>
+        <span class="tag tag-f">Env Fake</span>
+      </div>
+      <div class="cas-card">
+        <div class="label">M<sub>rr</sub></div>
+        <div class="desc">Mixed — Both Real</div>
+        <span class="tag tag-r">Speech Real</span>
+        <span class="tag tag-r">Env Real</span>
+      </div>
+      <div class="cas-card">
+        <div class="label">M<sub>ff</sub></div>
+        <div class="desc">Mixed — Both Fake</div>
+        <span class="tag tag-f">Speech Fake</span>
+        <span class="tag tag-f">Env Fake</span>
+      </div>
+      <div class="cas-card">
+        <div class="label">M<sub>rf</sub></div>
+        <div class="desc">Mixed — Real Speech, Fake Env</div>
+        <span class="tag tag-r">Speech Real</span>
+        <span class="tag tag-f">Env Fake</span>
+      </div>
+      <div class="cas-card">
+        <div class="label">M<sub>fr</sub></div>
+        <div class="desc">Mixed — Fake Speech, Real Env</div>
+        <span class="tag tag-f">Speech Fake</span>
+        <span class="tag tag-r">Env Real</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Audio Samples -->
+  <section id="samples">
+    <h2><span class="icon">🎧</span>Audio Samples</h2>
+    <p class="cas-intro" style="margin-bottom:28px;">
+      Each sample below is drawn from the <strong>SAS-CF</strong> dataset. Samples are trimmed to 4 seconds and normalised. Labels indicate the ground-truth CAS state.
+    </p>
+
+    <!-- s_r -->
+    <div class="cond-block">
+      <div class="cond-header">
+        <div class="cond-name">s<sub>r</sub></div>
+        <div>
+          <div class="cond-desc">Real speech, no environment</div>
+          <div class="badges" style="margin-top:5px;">
+            <span class="badge badge-speech-r">Speech: Real</span>
+            <span class="badge badge-env-r" style="background:#f1f5f9;color:#64748b;">Env: Absent</span>
+          </div>
+        </div>
+      </div>
+      <div class="samples-row">
+        <div class="sample-card"><div class="sample-num">Sample 1</div><audio controls src="audio/s_r/sample1.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 2</div><audio controls src="audio/s_r/sample2.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 3</div><audio controls src="audio/s_r/sample3.wav"></audio></div>
+      </div>
+    </div>
+
+    <!-- s_f -->
+    <div class="cond-block">
+      <div class="cond-header">
+        <div class="cond-name">s<sub>f</sub></div>
+        <div>
+          <div class="cond-desc">Codec-synthesised speech, no environment</div>
+          <div class="badges" style="margin-top:5px;">
+            <span class="badge badge-speech-f">Speech: Fake</span>
+            <span class="badge badge-env-r" style="background:#f1f5f9;color:#64748b;">Env: Absent</span>
+          </div>
+        </div>
+      </div>
+      <div class="samples-row">
+        <div class="sample-card"><div class="sample-num">Sample 1</div><audio controls src="audio/s_f/sample1.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 2</div><audio controls src="audio/s_f/sample2.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 3</div><audio controls src="audio/s_f/sample3.wav"></audio></div>
+      </div>
+    </div>
+
+    <!-- e_r -->
+    <div class="cond-block">
+      <div class="cond-header">
+        <div class="cond-name">e<sub>r</sub></div>
+        <div>
+          <div class="cond-desc">Real environmental sound, no speech</div>
+          <div class="badges" style="margin-top:5px;">
+            <span class="badge badge-speech-r" style="background:#f1f5f9;color:#64748b;">Speech: Absent</span>
+            <span class="badge badge-env-r">Env: Real</span>
+          </div>
+        </div>
+      </div>
+      <div class="samples-row">
+        <div class="sample-card"><div class="sample-num">Sample 1</div><audio controls src="audio/e_r/sample1.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 2</div><audio controls src="audio/e_r/sample2.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 3</div><audio controls src="audio/e_r/sample3.wav"></audio></div>
+      </div>
+    </div>
+
+    <!-- e_f -->
+    <div class="cond-block">
+      <div class="cond-header">
+        <div class="cond-name">e<sub>f</sub></div>
+        <div>
+          <div class="cond-desc">Codec-resynthesised environment, no speech</div>
+          <div class="badges" style="margin-top:5px;">
+            <span class="badge badge-speech-r" style="background:#f1f5f9;color:#64748b;">Speech: Absent</span>
+            <span class="badge badge-env-f">Env: Fake</span>
+          </div>
+        </div>
+      </div>
+      <div class="samples-row">
+        <div class="sample-card"><div class="sample-num">Sample 1</div><audio controls src="audio/e_f/sample1.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 2</div><audio controls src="audio/e_f/sample2.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 3</div><audio controls src="audio/e_f/sample3.wav"></audio></div>
+      </div>
+    </div>
+
+    <!-- M_rr -->
+    <div class="cond-block">
+      <div class="cond-header">
+        <div class="cond-name">M<sub>rr</sub></div>
+        <div>
+          <div class="cond-desc">Real speech mixed with real environment</div>
+          <div class="badges" style="margin-top:5px;">
+            <span class="badge badge-speech-r">Speech: Real</span>
+            <span class="badge badge-env-r">Env: Real</span>
+          </div>
+        </div>
+      </div>
+      <div class="samples-row">
+        <div class="sample-card"><div class="sample-num">Sample 1</div><audio controls src="audio/M_rr/sample1.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 2</div><audio controls src="audio/M_rr/sample2.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 3</div><audio controls src="audio/M_rr/sample3.wav"></audio></div>
+      </div>
+    </div>
+
+    <!-- M_ff -->
+    <div class="cond-block">
+      <div class="cond-header">
+        <div class="cond-name">M<sub>ff</sub></div>
+        <div>
+          <div class="cond-desc">Fake speech mixed with fake environment</div>
+          <div class="badges" style="margin-top:5px;">
+            <span class="badge badge-speech-f">Speech: Fake</span>
+            <span class="badge badge-env-f">Env: Fake</span>
+          </div>
+        </div>
+      </div>
+      <div class="samples-row">
+        <div class="sample-card"><div class="sample-num">Sample 1</div><audio controls src="audio/M_ff/sample1.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 2</div><audio controls src="audio/M_ff/sample2.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 3</div><audio controls src="audio/M_ff/sample3.wav"></audio></div>
+      </div>
+    </div>
+
+    <!-- M_rf -->
+    <div class="cond-block">
+      <div class="cond-header">
+        <div class="cond-name">M<sub>rf</sub></div>
+        <div>
+          <div class="cond-desc">Real speech mixed with fake environment</div>
+          <div class="badges" style="margin-top:5px;">
+            <span class="badge badge-speech-r">Speech: Real</span>
+            <span class="badge badge-env-f">Env: Fake</span>
+          </div>
+        </div>
+      </div>
+      <div class="samples-row">
+        <div class="sample-card"><div class="sample-num">Sample 1</div><audio controls src="audio/M_rf/sample1.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 2</div><audio controls src="audio/M_rf/sample2.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 3</div><audio controls src="audio/M_rf/sample3.wav"></audio></div>
+      </div>
+    </div>
+
+    <!-- M_fr -->
+    <div class="cond-block">
+      <div class="cond-header">
+        <div class="cond-name">M<sub>fr</sub></div>
+        <div>
+          <div class="cond-desc">Fake speech mixed with real environment</div>
+          <div class="badges" style="margin-top:5px;">
+            <span class="badge badge-speech-f">Speech: Fake</span>
+            <span class="badge badge-env-r">Env: Real</span>
+          </div>
+        </div>
+      </div>
+      <div class="samples-row">
+        <div class="sample-card"><div class="sample-num">Sample 1</div><audio controls src="audio/M_fr/sample1.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 2</div><audio controls src="audio/M_fr/sample2.wav"></audio></div>
+        <div class="sample-card"><div class="sample-num">Sample 3</div><audio controls src="audio/M_fr/sample3.wav"></audio></div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- Dataset Sources -->
+  <section id="dataset">
+    <h2><span class="icon">🗂️</span>Dataset — SAS-CF</h2>
+    <p class="cas-intro" style="margin-bottom:20px;">
+      SAS-CF is constructed from the following public corpora and augmented using 19 neural audio codecs. No download links are provided during the review period.
+    </p>
+    <div class="source-grid">
+      <div class="source-card">
+        <div class="src-type">Speech — Real</div>
+        <div class="src-name">L2-ARCTIC</div>
+        <div class="src-detail">24 non-native English speakers, ~67K utterances</div>
+      </div>
+      <div class="source-card">
+        <div class="src-type">Speech — Real</div>
+        <div class="src-name">VCTK</div>
+        <div class="src-detail">107 English speakers, ~44K utterances</div>
+      </div>
+      <div class="source-card">
+        <div class="src-type">Environment — Real</div>
+        <div class="src-name">TAU Urban Acoustic Scenes 2019</div>
+        <div class="src-detail">11 acoustic scenes, 10 cities</div>
+      </div>
+      <div class="source-card">
+        <div class="src-type">Speech — Fake</div>
+        <div class="src-name">19 Neural Audio Codecs</div>
+        <div class="src-detail">EnCodec, DAC, SoundStream, FunCodec, SpeechTokenizer, AudioDec, HiFi-Codec, AcademiCodec</div>
+      </div>
+      <div class="source-card">
+        <div class="src-type">Environment — Fake</div>
+        <div class="src-name">Codec-resynthesised TAU</div>
+        <div class="src-detail">Same 19 codecs applied to TAU scenes</div>
+      </div>
+      <div class="source-card">
+        <div class="src-type">Mixed</div>
+        <div class="src-name">SAS-CF Mix</div>
+        <div class="src-detail">1.8M+ clips across 8 CAS states</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Model -->
+  <section id="model">
+    <h2><span class="icon">🤖</span>HARPER — Model Overview</h2>
+    <p class="cas-intro" style="margin-bottom:20px;">
+      HARPER (Hierarchical Audio Reasoning with Probe-Enhanced Representations) combines <strong>neural codec probing</strong>, <strong>hyperbolic product-space CAS reasoning</strong>, and a <strong>generative audio language model</strong> (Qwen2-0.5B) to jointly predict both speech and environmental authenticity.
+    </p>
+    <div class="figure-wrap" style="margin-bottom:20px;">
+      <img src="images/per_cond_acc.png" alt="Per-condition Joint Accuracy" style="max-width:700px;" />
+      <div class="caption">Figure: Joint accuracy (both components correct) across all 8 CAS conditions on SAS-CF.</div>
+    </div>
+    <div class="figure-wrap">
+      <img src="images/confusion_matrix.png" alt="CAS Confusion Matrix" style="max-width:580px;" />
+      <div class="caption">Figure: Row-normalised confusion matrix over 8 CAS states. Hardest conditions: M<sub>rf</sub> ↔ M<sub>fr</sub> mirror confusion.</div>
+    </div>
+  </section>
+
+  <!-- Citation -->
+  <section id="citation">
+    <h2><span class="icon">📋</span>Citation</h2>
+    <div class="citation-box" id="bibtex">@inproceedings{harper2026,
+  title     = {Rethinking Audio Spoofing: When Authenticity Becomes Compositional},
+  booktitle = {Proceedings of the 64th Annual Meeting of the
+               Association for Computational Linguistics (ACL)},
+  year      = {2026},
+  note      = {Under review — anonymous submission}
+}<button class="copy-btn" onclick="copyBib()">Copy</button></div>
+  </section>
+
+</main>
+
+<footer>
+  Anonymous submission · ACL 2026 · Audio samples from public corpora; see paper for details.
+</footer>
+
+<script>
+function copyBib() {
+  const text = document.getElementById('bibtex').innerText.replace('Copy','').trim();
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector('.copy-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy', 1800);
+  });
+}
+</script>
+</body>
+</html>
