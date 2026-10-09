@@ -87,7 +87,7 @@ def _run_inference(model, file_list, cfg, batch_size, device):
             out = model(wav)
 
         pfake_all.extend(out['p_fake'].cpu().float().tolist())
-        # per-component fake probabilities (col 2 = F)
+        # logit_s / logit_e are (B,3) — argmax gives predicted class
         ps_all.extend(out['logit_s'].softmax(-1)[:, 2].cpu().float().tolist())
         pe_all.extend(out['logit_e'].softmax(-1)[:, 2].cpu().float().tolist())
 

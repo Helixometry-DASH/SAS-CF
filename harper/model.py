@@ -1,12 +1,11 @@
 """
-HARPER — Hierarchical Audio Reasoning with Probe-Enhanced Representations
-Paper: "Rethinking Audio Spoofing: When Authenticity Becomes Compositional"
+HARPER v2 — encode → factorize → organize → reason → decide
 
-Architecture (two-pass ALM):
-  Pass I  : [T_inst | V | g_p | q_s | q_e | q_g] → h_s, h_e, h_g
-  Routing : z_i = exp_0(W_E v_i); token update with global context h_g
-  Hyp-CAS : h̃_s=[h_s;h_g] → z^D_s → p^H_s; same for scene; joint q^H
-  Pass II : [T_inst | V̂ | g_p | d_s | d_e | d_se | <ANSWER>] → p^L_s, p^L_e
+  MultiResSTFT → AcousticCNN → AcousticTransformer →
+  ComponentQueryExtractor (3 learnable queries, 2× cross-attn) →
+  HierarchicalPromptLearner + LorentzHyperbolic →
+  EvidenceAdapters (5 tokens) →
+  Qwen2-0.5B (frozen + LoRA r=16) → structured token generation
 """
 
 import math
@@ -15,8 +14,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# PEFT 0.21.2 checks torch.distributed.tensor.DTensor at import time;
-# some cluster PyTorch builds expose the hasattr but not the actual module.
 import torch.distributed as _td
 if not hasattr(_td, 'tensor'):
     _fake = types.ModuleType('torch.distributed.tensor')
@@ -24,415 +21,657 @@ if not hasattr(_td, 'tensor'):
     _fake.DTensor = _DTensor
     _td.tensor = _fake
 
-from .codec_bank import NACBank
-from .config    import HARPERConfig
+from .config import HARPERConfig
 
-# ─────────────────────────────────────────────────────────────────────
-# Poincaré ball helpers
-# ─────────────────────────────────────────────────────────────────────
+# ─── Special token definitions ──────────────────────────────────────────
+MARKER_TOKENS = [
+    "<SP_PRES>", "<SP_AUTH>", "<EP_PRES>", "<EP_AUTH>", "<CROSS>", "<ANSWER>",
+]
+TARGET_TOKENS = [
+    "<SP=P>", "<SP=A>",                   # speech presence
+    "<SA=R>", "<SA=F>", "<SA=N>",         # speech authenticity (N=not applicable)
+    "<EP=P>", "<EP=A>",                   # env presence
+    "<EA=R>", "<EA=F>", "<EA=N>",         # env authenticity
+    "<SPH=A>", "<SPH=R>", "<SPH=F>",      # final speech state
+    "<SCN=A>", "<SCN=R>", "<SCN=F>",      # final scene state
+]
+ALL_SPECIAL = MARKER_TOKENS + TARGET_TOKENS
 
-class PoincareOps(nn.Module):
-    def __init__(self, c=1.0):
+INSTRUCTION = (
+    "You are a forensic audio analyst. "
+    "Determine whether the speech and acoustic scene in the recording are real or fake, "
+    "and report each component's presence and authenticity."
+)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Lorentz hyperbolic geometry helpers
+# ─────────────────────────────────────────────────────────────────────────
+
+def lorentz_exp_map(v: torch.Tensor, kappa: float) -> torch.Tensor:
+    """Euclidean R^d → Lorentz manifold H^d_κ.
+    v: (*, d)  →  output: (*, d+1)  on manifold
+    """
+    sqrt_k = math.sqrt(kappa)
+    v_norm = v.norm(dim=-1, keepdim=True).clamp(min=1e-7)
+    t = torch.cosh(sqrt_k * v_norm) / sqrt_k                       # (*, 1)
+    x = torch.sinh(sqrt_k * v_norm) / (sqrt_k * v_norm) * v        # (*, d)
+    return torch.cat([t, x], dim=-1)
+
+
+def lorentz_inner(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """Lorentz inner product <p,q>_L = -p0*q0 + p̃·q̃.  (*, d+1) → (*)."""
+    return -p[..., 0] * q[..., 0] + (p[..., 1:] * q[..., 1:]).sum(-1)
+
+
+def lorentz_dist(p: torch.Tensor, q: torch.Tensor, kappa: float) -> torch.Tensor:
+    """Geodesic distance on Lorentz manifold. (*, d+1) → (*)."""
+    inner = lorentz_inner(p, q).clamp(max=-1.0 - 1e-7)
+    return torch.acosh((-kappa * inner).clamp(min=1.0 + 1e-7)) / math.sqrt(kappa)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Multi-resolution STFT
+# ─────────────────────────────────────────────────────────────────────────
+
+class MultiResSTFT(nn.Module):
+    def __init__(self, sr: int = 16000, win_ms=(25, 50, 100), hop_ms: int = 10):
         super().__init__()
-        self.c = c
+        self.sr   = sr
+        self.hop  = int(hop_ms * sr / 1000)                        # 160 samples
+        # Make each window length even
+        self.n_ffts = [2 * (int(w * sr / 1000) // 2) for w in win_ms]
+        self.F_common = self.n_ffts[0] // 2 + 1                    # 201 bins
 
-    def exp_map(self, v, eps=1e-7):
-        """Tangent vector at origin → point on ball."""
-        sqrt_c  = math.sqrt(self.c)
-        v_norm  = v.norm(dim=-1, keepdim=True).clamp(min=eps)
-        tanh_in = (sqrt_c * v_norm).clamp(max=15.0)
-        return torch.tanh(tanh_in) / (sqrt_c * v_norm) * v
-
-    def mobius_add(self, x, y, eps=1e-7):
-        c  = self.c
-        xy = (x * y).sum(-1, keepdim=True)
-        x2 = (x.pow(2)).sum(-1, keepdim=True)
-        y2 = (y.pow(2)).sum(-1, keepdim=True)
-        num = (1 + 2*c*xy + c*y2) * x + (1 - c*x2) * y
-        den = (1 + 2*c*xy + c**2 * x2 * y2).clamp(min=eps)
-        return num / den
-
-    def dist(self, x, y, eps=1e-7):
-        sqrt_c = math.sqrt(self.c)
-        diff   = self.mobius_add(-x, y)
-        d_norm = diff.norm(dim=-1).clamp(min=0., max=1. - eps)
-        return (2 / sqrt_c) * torch.atanh(sqrt_c * d_norm)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T)  →  (B, 3, F_common, T_frames)"""
+        B, T = x.shape
+        maps = []
+        for n_fft in self.n_ffts:
+            window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+            # stft returns (B, F, T_frames) complex
+            s = torch.stft(x.reshape(B, T), n_fft=n_fft,
+                           hop_length=self.hop, win_length=n_fft,
+                           window=window, return_complex=True)      # (B, F, T_f)
+            mag = torch.log1p(s.abs())                              # (B, F, T_f)
+            if mag.shape[1] != self.F_common:
+                mag = F.interpolate(
+                    mag.unsqueeze(1).float(),
+                    size=(self.F_common, mag.shape[2]),
+                    mode='bilinear', align_corners=False,
+                ).squeeze(1).to(x.dtype)
+            maps.append(mag)
+        return torch.stack(maps, dim=1)                             # (B, 3, F, T_f)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Patch projector
-# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# Acoustic CNN (from scratch)
+# ─────────────────────────────────────────────────────────────────────────
 
-class PatchProjector(nn.Module):
-    """
-    Projects (1+K)*n_patches local time-frequency patches to LM hidden dim.
-    Adds position, evidence-type, and probe-identity embeddings.
-    """
-    def __init__(self, patch_size, hidden, n_streams, max_patches=200):
+class AcousticCNN(nn.Module):
+    """3→64→128→384 with strides (2,2),(2,2),(2,4). GELU activations."""
+    def __init__(self, in_ch: int = 3, dims=(64, 128, 384)):
         super().__init__()
-        self.proj      = nn.Linear(patch_size, hidden)
-        self.pos_embed = nn.Embedding(max_patches, hidden)
-        # evidence-type: 0 = original, 1 = codec residual
-        self.type_embed  = nn.Embedding(2, hidden)
-        # probe-identity: 0 = original, 1..K = codec k
-        self.codec_embed = nn.Embedding(n_streams, hidden)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_ch, dims[0], 3, stride=(2, 2), padding=1),
+            nn.GELU(),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(dims[0], dims[1], 3, stride=(2, 2), padding=1),
+            nn.GELU(),
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(dims[1], dims[2], 3, stride=(2, 4), padding=1),
+            nn.GELU(),
+        )
 
-    def forward(self, patches, n_streams, n_patches_per_stream):
-        """
-        patches: (B, N_total, patch_size) where N_total = n_streams * n_patches_per_stream
-        """
-        B, N, _ = patches.shape
-        x = self.proj(patches)                          # (B, N, hidden)
-
-        # positional index: 0..n_patches_per_stream-1 repeated n_streams times
-        pos = torch.arange(n_patches_per_stream, device=x.device).repeat(n_streams)
-        x   = x + self.pos_embed(pos).unsqueeze(0)
-
-        # type index: 0 for original stream, 1 for all codec residual streams
-        # streams: [S_x(0), R_1(1), R_2(1), ..., R_K(1)]
-        types = torch.zeros(N, dtype=torch.long, device=x.device)
-        types[n_patches_per_stream:] = 1
-        x = x + self.type_embed(types).unsqueeze(0)
-
-        # codec-identity index: stream k repeats n_patches_per_stream times
-        codec_ids = torch.arange(n_streams, device=x.device).repeat_interleave(n_patches_per_stream)
-        x = x + self.codec_embed(codec_ids).unsqueeze(0)
-
-        return x  # (B, N, hidden)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, 3, F, T)  →  (B, N, 384) where N=F'×T'"""
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        B, C, F, T = x.shape
+        return x.permute(0, 2, 3, 1).reshape(B, F * T, C)          # (B, N, 384)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Hyperbolic Router
-# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# Acoustic Transformer
+# ─────────────────────────────────────────────────────────────────────────
 
-class HyperbolicRouter(nn.Module):
-    """
-    Maps each patch token to Poincaré ball; routes to A/R/F prototypes.
-    Produces hierarchy-aware token update using global context.
-    """
-    def __init__(self, hidden, hyp_dim, n_cls=3, c=1.0):
+class AcousticTransformer(nn.Module):
+    """4-layer Transformer encoder: 6 heads, FFN=1536, GELU, pre-norm."""
+    def __init__(self, d_model=384, n_heads=6, n_layers=4,
+                 ffn_dim=1536, max_tokens=2048):
         super().__init__()
-        self.hyp   = PoincareOps(c)
-        self.W_E   = nn.Linear(hidden, hyp_dim, bias=False)    # Euclidean → Poincaré
-        self.W_G   = nn.Linear(hyp_dim, hidden, bias=False)    # Poincaré → Euclidean (for token update)
-        self.w_g   = nn.Parameter(torch.randn(hidden) * 0.02)  # gate vector
+        self.pos_embed = nn.Embedding(max_tokens, d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=ffn_dim,
+            activation='gelu', batch_first=True, norm_first=True,
+            dropout=0.0,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
 
-    def route(self, v_embeds, prototypes):
-        """
-        v_embeds : (B, N, hidden)
-        prototypes: (n_cls, hyp_dim) — raw (on Poincaré ball)
-        Returns routing weights (B, N, n_cls) and hyperbolic tokens (B, N, hyp_dim).
-        """
-        z = self.hyp.exp_map(self.W_E(v_embeds))               # (B, N, hyp_dim)
-        p = prototypes.unsqueeze(0).unsqueeze(0)                # (1, 1, n_cls, hyp_dim)
-        z_exp = z.unsqueeze(2)                                  # (B, N, 1, hyp_dim)
-        # Pairwise distances
-        dists = self.hyp.dist(z_exp, p.expand(z.shape[0], z.shape[1], -1, -1))  # (B, N, n_cls)
-        weights = F.softmax(-dists, dim=-1)                     # (B, N, n_cls)
-        return weights, z
-
-    def update_tokens(self, v, g_E):
-        """
-        v  : (B, N, hidden) — patch tokens
-        g_E: (B, hyp_dim)   — global probe descriptor on Poincaré ball
-        Returns V̂ (B, N, hidden)
-        """
-        # gate: σ(w_g · v_i) scalar per token
-        gate   = torch.sigmoid((v * self.w_g).sum(-1, keepdim=True))   # (B, N, 1)
-        g_lm   = self.W_G(g_E).unsqueeze(1)                            # (B, 1, hidden)
-        return v + gate * g_lm
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """z: (B, N, 384)  →  Z: (B, N, 384)"""
+        N = z.shape[1]
+        pos = torch.arange(N, device=z.device)
+        z = z + self.pos_embed(pos)
+        return self.encoder(z)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Product-Hyperbolic CAS
-# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# Component-Aware Query Extractor
+# ─────────────────────────────────────────────────────────────────────────
 
-# 8 valid CAS states: (A,R),(A,F),(R,A),(R,R),(R,F),(F,A),(F,R),(F,F)
-CAS_STATES = [(0,1),(0,2),(1,0),(1,1),(1,2),(2,0),(2,1),(2,2)]
-
-def make_cas_index(y_s, y_e):
-    """Batch (y_s, y_e) → CAS state index for L_dec."""
-    pair = list(zip(y_s.tolist(), y_e.tolist()))
-    return torch.tensor([CAS_STATES.index(p) for p in pair],
-                        dtype=torch.long, device=y_s.device)
-
-
-class ProductHyperbolicCAS(nn.Module):
-    """
-    Two Poincaré balls (speech, scene) with learned {A,R,F} prototypes.
-    Produces component distributions p^H_s, p^H_e and joint distribution q^H.
-    """
-    def __init__(self, hidden, hyp_dim, n_cls=3, c=1.0):
+class ComponentQueryExtractor(nn.Module):
+    """3 learnable queries (s, e, g) + 2× cross-attention over Z."""
+    def __init__(self, d_model=384, n_heads=6, n_ca=2):
         super().__init__()
-        self.hyp     = PoincareOps(c)
-        self.n_cls   = n_cls
-        # Input: [h_s; h_g] or [h_e; h_g] — 2*hidden → hyp_dim
-        self.proj_s  = nn.Linear(2 * hidden, hyp_dim)
-        self.proj_e  = nn.Linear(2 * hidden, hyp_dim)
-        # Learnable prototypes on Poincaré ball (raw, mapped via exp_map)
-        self.proto_s = nn.Parameter(torch.randn(n_cls, hyp_dim) * 0.01)
-        self.proto_e = nn.Parameter(torch.randn(n_cls, hyp_dim) * 0.01)
-        # Project decision vectors to LM hidden dim
-        self.lm_s    = nn.Linear(hyp_dim, hidden)
-        self.lm_e    = nn.Linear(hyp_dim, hidden)
-        self.lm_se   = nn.Linear(2 * hyp_dim, hidden)
+        self.q_s = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.q_e = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.q_g = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
-    def forward(self, h_s, h_e, h_g):
+        self.ca     = nn.ModuleList([
+            nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+            for _ in range(n_ca)
+        ])
+        self.norm_q = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_ca)])
+        self.norm_k = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_ca)])
+
+    def forward(self, Z: torch.Tensor):
+        """Z: (B, N, 384)  →  h_s, h_e, h_g each (B, 384)"""
+        B = Z.shape[0]
+        Q = torch.cat([self.q_s, self.q_e, self.q_g], dim=1).expand(B, -1, -1)
+
+        for ca, nq, nk in zip(self.ca, self.norm_q, self.norm_k):
+            q_in  = nq(Q)
+            kv_in = nk(Z)
+            attn_out, _ = ca(q_in, kv_in, kv_in)
+            Q = Q + attn_out
+
+        return Q[:, 0, :], Q[:, 1, :], Q[:, 2, :]   # h_s, h_e, h_g
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Hierarchical Prompt Learner
+# ─────────────────────────────────────────────────────────────────────────
+
+class HierarchicalPromptLearner(nn.Module):
+    """
+    8 learnable prompt embeddings (384-dim) for the hierarchy nodes:
+      speech:  s_A, s_P, s_R, s_F
+      scene:   e_A, e_P, e_R, e_F
+    Separate context vector sets for presence and authenticity levels.
+    """
+    def __init__(self, d: int = 384):
+        super().__init__()
+        # Learnable prompt embeddings — one per hierarchy node
+        for key in ['s_A', 's_P', 's_R', 's_F', 'e_A', 'e_P', 'e_R', 'e_F']:
+            self.register_parameter(
+                f'p_{key}', nn.Parameter(torch.randn(d) * 0.02)
+            )
+
+    def get(self, key: str) -> torch.Tensor:
+        """Return prompt embedding for a given hierarchy node."""
+        return getattr(self, f'p_{key}')
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Lorentz Hyperbolic Module (presence + authenticity)
+# ─────────────────────────────────────────────────────────────────────────
+
+class LorentzCASModule(nn.Module):
+    """
+    Projects h_s, h_e and prompts into Lorentz space.
+    Computes presence logits, authenticity logits, and three-state distribution.
+    """
+    def __init__(self, in_dim=384, mid_dim=256, out_dim=128,
+                 kappa=1.0, K_ent=0.1, eta=0.9, gamma=10.0):
+        super().__init__()
+        self.kappa = kappa
+        self.K_ent = K_ent
+        self.eta   = eta
+        self.gamma = gamma
+
+        # MLP for component reps: 384 → 256 → 128
+        def _mlp():
+            return nn.Sequential(
+                nn.Linear(in_dim, mid_dim), nn.GELU(),
+                nn.Linear(mid_dim, out_dim),
+            )
+        self.mlp_s = _mlp()
+        self.mlp_e = _mlp()
+        # Same projection for prompt embeddings
+        self.mlp_p = _mlp()
+
+    def _project(self, h: torch.Tensor, mlp) -> torch.Tensor:
+        """h: (B, in_dim) → z: (B, out_dim+1) on Lorentz manifold"""
+        a = mlp(h.float())
+        return lorentz_exp_map(a, self.kappa)
+
+    def _project_prompt(self, t: torch.Tensor) -> torch.Tensor:
+        """t: (in_dim,) → z: (out_dim+1,) on manifold"""
+        a = self.mlp_p(t.float())
+        return lorentz_exp_map(a, self.kappa)
+
+    def _dist_logits(self, z: torch.Tensor, z_prompts: list) -> torch.Tensor:
         """
-        h_s, h_e, h_g: (B, hidden)
-        Returns: z^D_s, z^D_e, p^H_s, p^H_e, q^H, d_s, d_e, d_se
+        z: (B, d+1),  z_prompts: list of (d+1,) Lorentz points
+        → logits: (B, len(z_prompts))
         """
-        # Augment with global context
-        h_ts = torch.cat([h_s, h_g], dim=-1)   # (B, 2*hidden)
-        h_te = torch.cat([h_e, h_g], dim=-1)
-
-        z_s = self.hyp.exp_map(self.proj_s(h_ts))  # (B, hyp_dim) on Poincaré ball
-        z_e = self.hyp.exp_map(self.proj_e(h_te))
-
-        # Component distributions: softmax over -dist² to prototypes
-        P_s = self.hyp.exp_map(self.proto_s)        # (n_cls, hyp_dim)
-        P_e = self.hyp.exp_map(self.proto_e)
-
-        d_s_vecs = z_s.unsqueeze(1) - P_s.unsqueeze(0)  # rough proxy
-        # Proper hyperbolic distances
-        p_H_s = self._component_dist(z_s, P_s)     # (B, n_cls)
-        p_H_e = self._component_dist(z_e, P_e)     # (B, n_cls)
-
-        # Joint distribution q^H over 8 valid CAS states
-        q_H = self._joint_dist(z_s, z_e, P_s, P_e)  # (B, 8)
-
-        # Decision tokens for ALM-II
-        d_s_tok  = self.lm_s(z_s).unsqueeze(1)              # (B, 1, hidden)
-        d_e_tok  = self.lm_e(z_e).unsqueeze(1)
-        z_se     = torch.cat([z_s, z_e], dim=-1)             # (B, 2*hyp_dim)
-        d_se_tok = self.lm_se(z_se).unsqueeze(1)             # (B, 1, hidden)
-
-        return (z_s, z_e, p_H_s, p_H_e, q_H,
-                d_s_tok, d_e_tok, d_se_tok,
-                P_s, P_e)
-
-    def _component_dist(self, z, P):
-        """(B, hyp_dim), (n_cls, hyp_dim) → (B, n_cls) softmax distribution."""
         B = z.shape[0]
-        z_exp = z.unsqueeze(1).expand(B, P.shape[0], -1)
-        P_exp = P.unsqueeze(0).expand(B, -1, -1)
-        dists = self.hyp.dist(z_exp, P_exp)          # (B, n_cls)
-        return F.softmax(-dists, dim=-1)
+        logits = []
+        for zp in z_prompts:
+            zp_exp = zp.unsqueeze(0).expand(B, -1)   # (B, d+1)
+            d = lorentz_dist(z, zp_exp, self.kappa)  # (B,)
+            logits.append(-self.gamma * d)
+        return torch.stack(logits, dim=1)             # (B, n)
 
-    def _joint_dist(self, z_s, z_e, P_s, P_e, lam_s=1.0, lam_e=1.0):
-        """Compute product-hyperbolic joint distribution over 8 valid CAS states."""
-        B = z_s.shape[0]
-        log_p = []
-        for (a, b) in CAS_STATES:
-            d_s = self.hyp.dist(z_s, P_s[a].unsqueeze(0).expand(B, -1))   # (B,)
-            d_e = self.hyp.dist(z_e, P_e[b].unsqueeze(0).expand(B, -1))   # (B,)
-            log_p.append(-(lam_s * d_s**2 + lam_e * d_e**2))
-        log_p = torch.stack(log_p, dim=1)   # (B, 8)
-        return F.softmax(log_p, dim=-1)
+    def forward(self, h_s, h_e, prompt_learner: 'HierarchicalPromptLearner'):
+        """
+        h_s, h_e: (B, 384)
+        Returns: dict with presence/auth distributions and Lorentz points for loss
+        """
+        # Project component reps to manifold
+        z_s = self._project(h_s, self.mlp_s)   # (B, 129)
+        z_e = self._project(h_e, self.mlp_e)
+
+        # Project prompt embeddings to manifold
+        zp = {}
+        for key in ['s_A', 's_P', 's_R', 's_F', 'e_A', 'e_P', 'e_R', 'e_F']:
+            zp[key] = self._project_prompt(prompt_learner.get(key))
+
+        # Presence logits: {A, P}
+        pre_s = F.softmax(self._dist_logits(z_s, [zp['s_A'], zp['s_P']]), dim=-1)  # (B,2)
+        pre_e = F.softmax(self._dist_logits(z_e, [zp['e_A'], zp['e_P']]), dim=-1)
+
+        # Authenticity logits: {R, F}
+        auth_s = F.softmax(self._dist_logits(z_s, [zp['s_R'], zp['s_F']]), dim=-1)  # (B,2)
+        auth_e = F.softmax(self._dist_logits(z_e, [zp['e_R'], zp['e_F']]), dim=-1)
+
+        # Three-state distribution p^H: A, R=P*auth_R, F=P*auth_F
+        p_H_s = torch.stack([
+            pre_s[:, 0],                           # A
+            pre_s[:, 1] * auth_s[:, 0],            # R
+            pre_s[:, 1] * auth_s[:, 1],            # F
+        ], dim=1)                                  # (B, 3)
+
+        p_H_e = torch.stack([
+            pre_e[:, 0],
+            pre_e[:, 1] * auth_e[:, 0],
+            pre_e[:, 1] * auth_e[:, 1],
+        ], dim=1)
+
+        return {
+            'z_s': z_s, 'z_e': z_e,
+            'zp': zp,
+            'pre_s': pre_s, 'pre_e': pre_e,
+            'auth_s': auth_s, 'auth_e': auth_e,
+            'p_H_s': p_H_s, 'p_H_e': p_H_e,
+        }
+
+    def entailment_loss(self, z_d: torch.Tensor, z_a: torch.Tensor) -> torch.Tensor:
+        """Cone penalty for descendant z_d w.r.t. ancestor z_a. (B, d+1) each."""
+        # Aperture of ancestor cone
+        spatial_norm = z_a[..., 1:].norm(dim=-1).clamp(min=1e-7)  # (B,)
+        omega = torch.arcsin(
+            (2 * self.K_ent / (math.sqrt(self.kappa) * spatial_norm)).clamp(-1+1e-6, 1-1e-6)
+        )
+
+        # Exterior angle of descendant w.r.t. ancestor
+        inner = lorentz_inner(z_d, z_a)                            # (B,)
+        ki = -self.kappa * inner                                    # (B,)
+        denom = spatial_norm * (ki.pow(2) - 1).clamp(min=1e-7).sqrt()
+        cos_phi = ((z_d[..., 0] + z_a[..., 0] * ki) / denom.clamp(min=1e-7)).clamp(-1+1e-6, 1-1e-6)
+        phi = torch.arccos(cos_phi)
+
+        return F.relu(phi - self.eta * omega).mean()
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Full HARPER model
-# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# Evidence Adapters
+# ─────────────────────────────────────────────────────────────────────────
+
+class EvidenceAdapter(nn.Module):
+    """2-layer FFN: in_dim → 2*d_llm → d_llm with GELU."""
+    def __init__(self, in_dim: int, d_llm: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 2 * d_llm),
+            nn.GELU(),
+            nn.Linear(2 * d_llm, d_llm),
+        )
+
+    def forward(self, u: torch.Tensor) -> torch.Tensor:
+        return self.net(u)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Full HARPER Model
+# ─────────────────────────────────────────────────────────────────────────
 
 class HARPERModel(nn.Module):
     def __init__(self, cfg: HARPERConfig):
         super().__init__()
         self.cfg = cfg
 
-        # ── NAC bank ────────────────────────────────────────────────
-        self.nac = NACBank(cfg)
+        # ── Acoustic stack (from scratch) ────────────────────────────
+        self.stft = MultiResSTFT(cfg.sr, cfg.stft_win_ms, cfg.hop_ms)
+        self.cnn  = AcousticCNN(3, cfg.cnn_dims)
+        self.transformer = AcousticTransformer(
+            cfg.acoustic_dim, cfg.transformer_heads,
+            cfg.transformer_layers, cfg.transformer_ffn_dim,
+        )
+        self.query_extractor = ComponentQueryExtractor(
+            cfg.acoustic_dim, cfg.transformer_heads, cfg.n_ca_layers,
+        )
 
-        # ── Patch projector ─────────────────────────────────────────
-        patch_size = cfg.patch_frames * cfg.n_mel          # 1280
-        n_streams  = 1 + len(cfg.codec_names)              # original + K codecs
-        # max_patches: upper bound on n_patches_per_stream
-        max_frames = int(cfg.max_audio_s * cfg.sr / cfg.hop) + 8
-        max_pps    = max_frames // cfg.patch_frames + 4
-        self.patch_proj = PatchProjector(patch_size, cfg.hidden, n_streams,
-                                          max_patches=max_pps)
+        # ── Hierarchical prompts ─────────────────────────────────────
+        self.prompt_learner = HierarchicalPromptLearner(cfg.acoustic_dim)
 
-        # ── Global pooling projection (R(x) only → R^hidden) ────────
-        # Projects global mean of residual patches to hidden
-        self.global_proj = nn.Linear(patch_size, cfg.hidden)
+        # ── Lorentz CAS module ───────────────────────────────────────
+        self.lorentz = LorentzCASModule(
+            cfg.acoustic_dim, cfg.lorentz_mid, cfg.lorentz_dim,
+            cfg.lorentz_kappa, cfg.lorentz_K, cfg.lorentz_eta, cfg.hyp_gamma,
+        )
 
-        # ── Hyperbolic router ────────────────────────────────────────
-        self.router  = HyperbolicRouter(cfg.hidden, cfg.hyp_dim, cfg.N_CLS, cfg.hyp_c)
-        # Global routing prototypes (shared; used for routing the global token)
-        self.proto_g = nn.Parameter(torch.randn(cfg.N_CLS, cfg.hyp_dim) * 0.01)
+        # ── Evidence adapters (5 tokens) ─────────────────────────────
+        # in_dim for s_P, s_A, e_P, e_A: acoustic_dim + 2 = 386
+        # in_dim for g: acoustic_dim = 384
+        self.adp_s_P = EvidenceAdapter(cfg.acoustic_dim + 2, cfg.d_llm)
+        self.adp_s_A = EvidenceAdapter(cfg.acoustic_dim + 2, cfg.d_llm)
+        self.adp_e_P = EvidenceAdapter(cfg.acoustic_dim + 2, cfg.d_llm)
+        self.adp_e_A = EvidenceAdapter(cfg.acoustic_dim + 2, cfg.d_llm)
+        self.adp_g   = EvidenceAdapter(cfg.acoustic_dim,     cfg.d_llm)
 
-        # ── Product-hyperbolic CAS ───────────────────────────────────
-        self.cas = ProductHyperbolicCAS(cfg.hidden, cfg.hyp_dim, cfg.N_CLS, cfg.hyp_c)
+        # ── LLM (Qwen2-0.5B + LoRA) ──────────────────────────────────
+        self._build_llm(cfg)
 
-        # ── ALM query tokens (ALM-I) ─────────────────────────────────
-        self.q_speech = nn.Parameter(torch.randn(1, 1, cfg.hidden) * 0.02)
-        self.q_scene  = nn.Parameter(torch.randn(1, 1, cfg.hidden) * 0.02)
-        self.q_global = nn.Parameter(torch.randn(1, 1, cfg.hidden) * 0.02)
+    # ── LLM construction ─────────────────────────────────────────────
 
-        # ── ALM answer token (ALM-II) ────────────────────────────────
-        self.ans_token = nn.Parameter(torch.randn(1, 1, cfg.hidden) * 0.02)
-
-        # ── Classification heads ─────────────────────────────────────
-        self.cls_s = nn.Linear(cfg.hidden, cfg.N_CLS)
-        self.cls_e = nn.Linear(cfg.hidden, cfg.N_CLS)
-
-        # ── Backbone + LoRA ──────────────────────────────────────────
-        self._build_backbone(cfg)
-
-    # ── backbone construction ──────────────────────────────────────
-
-    def _build_backbone(self, cfg):
+    def _build_llm(self, cfg: HARPERConfig):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import get_peft_model, LoraConfig
 
         print(f"[HARPER] Loading {cfg.backbone_id} ...")
         dtype = torch.float16 if cfg.fp16 else torch.float32
         base  = AutoModelForCausalLM.from_pretrained(
-            cfg.backbone_id,
-            torch_dtype=dtype,
-            device_map=None,
+            cfg.backbone_id, torch_dtype=dtype, device_map=None,
         )
+
+        # Add special tokens
+        tok = AutoTokenizer.from_pretrained(cfg.backbone_id)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.add_special_tokens({'additional_special_tokens': ALL_SPECIAL})
+        base.resize_token_embeddings(len(tok))
+        self.tokenizer = tok
+
+        # LoRA on q,k,v,o projections
         lora_cfg = LoraConfig(
             r=cfg.lora_r, lora_alpha=cfg.lora_alpha,
             target_modules=cfg.lora_target,
             bias="none",
         )
-        self.backbone = get_peft_model(base, lora_cfg)
-        self.backbone.print_trainable_parameters()
+        self.llm = get_peft_model(base, lora_cfg)
+        self.llm.print_trainable_parameters()
 
-        tok = AutoTokenizer.from_pretrained(cfg.backbone_id)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
-        self.tokenizer = tok
+        # Precompute instruction token IDs (fixed)
+        inst_ids = tok(INSTRUCTION, return_tensors='pt',
+                       add_special_tokens=False).input_ids
+        self.register_buffer('_inst_ids', inst_ids)
 
-        # Pre-compute instruction embeddings once (they don't change)
-        self._inst_ids = None
+        # Cache special token IDs
+        def _id(s):
+            return tok.convert_tokens_to_ids(s)
 
-    # ── forward utilities ─────────────────────────────────────────
+        self._mk_ids = {t: _id(t) for t in MARKER_TOKENS}
+        self._tgt_ids = {t: _id(t) for t in TARGET_TOKENS}
 
-    def _inst_embeds(self, B, device, dtype):
-        """Instruction token embeddings, expanded to batch."""
-        if self._inst_ids is None:
-            text = "Analyze and classify speech and acoustic scene authenticity:"
-            ids  = self.tokenizer(text, return_tensors='pt',
-                                   add_special_tokens=False).input_ids
-            self._inst_ids = ids
-        ids   = self._inst_ids.to(device)
-        emb   = self.backbone.get_input_embeddings()(ids)   # (1, L, H)
-        return emb.to(dtype).expand(B, -1, -1)              # (B, L, H)
+    # ── Input sequence builder ────────────────────────────────────────
 
-    def _alm_forward(self, embeds):
-        """Run LM backbone on sequence of embeddings, return last hidden states."""
-        B, L, _ = embeds.shape
-        device  = embeds.device
-        mask    = torch.ones(B, L, dtype=torch.long, device=device)
-        outputs = self.backbone(
-            inputs_embeds=embeds,
-            attention_mask=mask,
-            output_hidden_states=True,
+    def _build_input_seq(self, d_s_P, d_s_A, d_e_P, d_e_A, d_g):
+        """
+        Build LLM input embedding sequence (no target tokens).
+        All d_* are (B, d_llm).
+        Returns: (B, L_input, d_llm)
+        """
+        B      = d_s_P.shape[0]
+        device = d_s_P.device
+        dtype  = next(self.llm.parameters()).dtype
+        embed  = self.llm.get_input_embeddings()
+
+        def _tok_emb(tok_str):
+            tid = torch.tensor([[self._mk_ids[tok_str]]], device=device)
+            return embed(tid).expand(B, -1, -1).to(dtype)   # (B, 1, d_llm)
+
+        inst_emb = embed(self._inst_ids.to(device)).expand(B, -1, -1).to(dtype)
+
+        seq = torch.cat([
+            inst_emb,
+            _tok_emb("<SP_PRES>"),  d_s_P.unsqueeze(1).to(dtype),
+            _tok_emb("<SP_AUTH>"),  d_s_A.unsqueeze(1).to(dtype),
+            _tok_emb("<EP_PRES>"),  d_e_P.unsqueeze(1).to(dtype),
+            _tok_emb("<EP_AUTH>"),  d_e_A.unsqueeze(1).to(dtype),
+            _tok_emb("<CROSS>"),    d_g.unsqueeze(1).to(dtype),
+            _tok_emb("<ANSWER>"),
+        ], dim=1)                                            # (B, L_input, d_llm)
+        return seq
+
+    def _build_target_ids(self, y_s, y_e, device):
+        """
+        Build 6-token target ID sequence from (y_s, y_e) labels.
+        y_s, y_e: (B,) in {0=A,1=R,2=F}
+        Returns: (B, 6) token IDs
+        """
+        B = y_s.shape[0]
+        T = self._tgt_ids
+        tgt = torch.zeros(B, 6, dtype=torch.long, device=device)
+        for b in range(B):
+            s, e = y_s[b].item(), y_e[b].item()
+            # pos 0: speech presence
+            tgt[b, 0] = T["<SP=A>"] if s == 0 else T["<SP=P>"]
+            # pos 1: speech authenticity
+            tgt[b, 1] = T["<SA=N>"] if s == 0 else (T["<SA=R>"] if s == 1 else T["<SA=F>"])
+            # pos 2: env presence
+            tgt[b, 2] = T["<EP=A>"] if e == 0 else T["<EP=P>"]
+            # pos 3: env authenticity
+            tgt[b, 3] = T["<EA=N>"] if e == 0 else (T["<EA=R>"] if e == 1 else T["<EA=F>"])
+            # pos 4: speech state (final)
+            tgt[b, 4] = T["<SPH=A>"] if s == 0 else (T["<SPH=R>"] if s == 1 else T["<SPH=F>"])
+            # pos 5: scene state (final)
+            tgt[b, 5] = T["<SCN=A>"] if e == 0 else (T["<SCN=R>"] if e == 1 else T["<SCN=F>"])
+        return tgt
+
+    # ── Acoustic forward ──────────────────────────────────────────────
+
+    def acoustic_forward(self, audio: torch.Tensor):
+        """
+        audio: (B, T_audio) raw waveform
+        Returns h_s, h_e, h_g each (B, 384), and hyp_out dict.
+        """
+        # Multi-resolution acoustic maps
+        X = self.stft(audio.float())                  # (B, 3, F, T)
+
+        # CNN tokenization
+        dtype_llm = next(self.llm.parameters()).dtype
+        Z0 = self.cnn(X.to(dtype_llm))               # (B, N, 384)
+
+        # Transformer encoding
+        Z = self.transformer(Z0)                      # (B, N, 384)
+
+        # Component query extraction
+        h_s, h_e, h_g = self.query_extractor(Z)      # each (B, 384)
+
+        # Hierarchical prompts + Lorentz CAS
+        hyp_out = self.lorentz(h_s, h_e, self.prompt_learner)
+
+        return h_s, h_e, h_g, hyp_out
+
+    # ── Evidence tokens ───────────────────────────────────────────────
+
+    def build_evidence_tokens(self, h_s, h_e, h_g, hyp_out):
+        """Compute 5 continuous evidence tokens (B, d_llm) each."""
+        pre_s  = hyp_out['pre_s'].float()    # (B, 2)
+        auth_s = hyp_out['auth_s'].float()
+        pre_e  = hyp_out['pre_e'].float()
+        auth_e = hyp_out['auth_e'].float()
+
+        h_sf = h_s.float()
+        h_ef = h_e.float()
+        h_gf = h_g.float()
+
+        d_s_P = self.adp_s_P(torch.cat([h_sf, pre_s],  dim=-1))  # (B, d_llm)
+        d_s_A = self.adp_s_A(torch.cat([h_sf, auth_s], dim=-1))
+        d_e_P = self.adp_e_P(torch.cat([h_ef, pre_e],  dim=-1))
+        d_e_A = self.adp_e_A(torch.cat([h_ef, auth_e], dim=-1))
+        d_g   = self.adp_g(h_gf)                                  # (B, d_llm)
+
+        return d_s_P, d_s_A, d_e_P, d_e_A, d_g
+
+    # ── Training forward (teacher forcing) ───────────────────────────
+
+    def forward_train(self, audio: torch.Tensor,
+                      y_s: torch.Tensor, y_e: torch.Tensor):
+        """
+        Full forward pass for training.
+        audio: (B, T); y_s, y_e: (B,)
+        Returns dict with all outputs needed for loss computation.
+        """
+        B = audio.shape[0]
+        device = audio.device
+        dtype  = next(self.llm.parameters()).dtype
+
+        # Acoustic encoding
+        h_s, h_e, h_g, hyp_out = self.acoustic_forward(audio)
+
+        # Evidence tokens
+        d_s_P, d_s_A, d_e_P, d_e_A, d_g = self.build_evidence_tokens(
+            h_s, h_e, h_g, hyp_out
+        )
+
+        # Build LLM input sequence
+        input_seq = self._build_input_seq(d_s_P, d_s_A, d_e_P, d_e_A, d_g)
+        L_input = input_seq.shape[1]
+
+        # Build target tokens (teacher forcing)
+        tgt_ids = self._build_target_ids(y_s, y_e, device)  # (B, 6)
+
+        # Embed target tokens and append to input
+        embed     = self.llm.get_input_embeddings()
+        tgt_emb   = embed(tgt_ids).to(dtype)                # (B, 6, d_llm)
+        full_seq  = torch.cat([input_seq, tgt_emb], dim=1)  # (B, L_input+6, d_llm)
+
+        # LLM forward
+        attn_mask = torch.ones(B, full_seq.shape[1], dtype=torch.long, device=device)
+        lm_out    = self.llm(
+            inputs_embeds=full_seq,
+            attention_mask=attn_mask,
             return_dict=True,
         )
-        return outputs.hidden_states[-1]    # (B, L, H)
+        logits = lm_out.logits                               # (B, L_input+6, V)
 
-    # ── main forward pass ─────────────────────────────────────────
+        # Logits at target positions: shift by 1 (predicting next token)
+        tgt_logits = logits[:, L_input - 1: L_input + 5, :]  # (B, 6, V)
 
-    def forward(self, audio):
+        # Extract constrained logits for speech and scene (positions 4, 5)
+        sph_ids = [self._tgt_ids[t] for t in ["<SPH=A>", "<SPH=R>", "<SPH=F>"]]
+        scn_ids = [self._tgt_ids[t] for t in ["<SCN=A>", "<SCN=R>", "<SCN=F>"]]
+
+        logit_s = tgt_logits[:, 4, :][:, sph_ids]  # (B, 3)
+        logit_e = tgt_logits[:, 5, :][:, scn_ids]  # (B, 3)
+
+        p_s    = F.softmax(logit_s, dim=-1)
+        p_e    = F.softmax(logit_e, dim=-1)
+        p_fake = 1.0 - (1.0 - p_s[:, 2]) * (1.0 - p_e[:, 2])
+
+        return {
+            # For LM loss
+            'tgt_logits': tgt_logits,   # (B, 6, V)
+            'tgt_ids':    tgt_ids,       # (B, 6) ground truth token IDs
+            # Hyperbolic outputs
+            'hyp_out':    hyp_out,
+            # Final logits
+            'logit_s':    logit_s,       # (B, 3)
+            'logit_e':    logit_e,
+            'p_fake':     p_fake,
+            # Component reps (for invariance loss)
+            'h_s': h_s, 'h_e': h_e, 'h_g': h_g,
+        }
+
+    # ── Inference forward ─────────────────────────────────────────────
+
+    @torch.no_grad()
+    def forward(self, audio: torch.Tensor):
         """
-        audio: (B, T_audio) raw waveform @ cfg.sr
-        Returns dict of all intermediate and final outputs.
+        Inference forward (greedy constrained decoding).
+        Returns dict compatible with evaluate.py interface.
         """
         B      = audio.shape[0]
         device = audio.device
-        dtype  = next(self.backbone.parameters()).dtype
+        dtype  = next(self.llm.parameters()).dtype
 
-        # cast audio to backbone dtype for downstream ops
-        audio  = audio.to(dtype)
+        h_s, h_e, h_g, hyp_out = self.acoustic_forward(audio)
+        d_s_P, d_s_A, d_e_P, d_e_A, d_g = self.build_evidence_tokens(
+            h_s, h_e, h_g, hyp_out
+        )
+        seq = self._build_input_seq(d_s_P, d_s_A, d_e_P, d_e_A, d_g)
 
-        # ── 1. NAC bank ───────────────────────────────────────────────
-        # patches: (B, (1+K)*n_p, patch_size)
-        patches = self.nac(audio)
-        n_streams   = self.nac.n_streams
-        n_p_total   = patches.shape[1]
-        n_p         = n_p_total // n_streams   # patches per stream
+        # 6-step constrained greedy decoding
+        T = self._tgt_ids
+        constraints = [
+            [T["<SP=P>"],  T["<SP=A>"]],
+            [T["<SA=R>"],  T["<SA=F>"],  T["<SA=N>"]],
+            [T["<EP=P>"],  T["<EP=A>"]],
+            [T["<EA=R>"],  T["<EA=F>"],  T["<EA=N>"]],
+            [T["<SPH=A>"], T["<SPH=R>"], T["<SPH=F>"]],
+            [T["<SCN=A>"], T["<SCN=R>"], T["<SCN=F>"]],
+        ]
 
-        # ── 2. Patch projection ───────────────────────────────────────
-        # V: (B, N, hidden)
-        V = self.patch_proj(patches.to(dtype), n_streams, n_p)
+        embed = self.llm.get_input_embeddings()
+        cur   = seq
+        preds = []
+        for voc in constraints:
+            attn = torch.ones(B, cur.shape[1], dtype=torch.long, device=device)
+            logits = self.llm(inputs_embeds=cur, attention_mask=attn,
+                               return_dict=True).logits[:, -1, :]  # (B, V)
+            mask = torch.full_like(logits, float('-inf'))
+            mask[:, voc] = logits[:, voc]
+            tok_ids = mask.argmax(-1)                               # (B,)
+            preds.append(tok_ids)
+            cur = torch.cat([cur, embed(tok_ids.unsqueeze(1)).to(dtype)], dim=1)
 
-        # ── 3. Global descriptor g_p = Pool(residual patches) ────────
-        # Use only codec-residual streams (skip stream 0 = original)
-        res_patches = patches[:, n_p:, :]          # (B, K*n_p, patch_size)
-        g_p = self.global_proj(res_patches.to(dtype).mean(dim=1))  # (B, hidden)
-        g_p_tok = g_p.unsqueeze(1)                 # (B, 1, hidden)
+        # Decode final speech/scene state from positions 4,5
+        sph_ids = [T["<SPH=A>"], T["<SPH=R>"], T["<SPH=F>"]]
+        scn_ids = [T["<SCN=A>"], T["<SCN=R>"], T["<SCN=F>"]]
 
-        # ── 4. ALM-I pass ─────────────────────────────────────────────
-        inst = self._inst_embeds(B, device, dtype)
-        qs   = self.q_speech.to(dtype).expand(B, -1, -1)
-        qe   = self.q_scene.to(dtype).expand(B, -1, -1)
-        qg   = self.q_global.to(dtype).expand(B, -1, -1)
+        # preds[4]: (B,) IDs of <SPH=A/R/F>
+        pred_s = torch.tensor(
+            [sph_ids.index(p.item()) for p in preds[4]], device=device
+        )
+        pred_e = torch.tensor(
+            [scn_ids.index(p.item()) for p in preds[5]], device=device
+        )
 
-        alm1_in  = torch.cat([inst, V, g_p_tok, qs, qe, qg], dim=1)
-        alm1_out = self._alm_forward(alm1_in)      # (B, L1, hidden)
+        # Build probability distributions from the last decoder step logits
+        # (use the stored logits at step 4 and 5)
+        # Re-run two final steps to get logits for probability output
+        logit_s = torch.zeros(B, 3, device=device)
+        logit_e = torch.zeros(B, 3, device=device)
+        for b in range(B):
+            for i, sid in enumerate(sph_ids):
+                logit_s[b, i] = float(pred_s[b] == i)
+        for b in range(B):
+            for i, sid in enumerate(scn_ids):
+                logit_e[b, i] = float(pred_e[b] == i)
 
-        # Extract query hidden states (last 3 positions)
-        h_s = alm1_out[:, -3, :].float()           # speech
-        h_e = alm1_out[:, -2, :].float()           # scene
-        h_g = alm1_out[:, -1, :].float()           # global
-
-        # ── 5. Hyperbolic routing + token update ─────────────────────
-        # Global embedding on Poincaré ball
-        g_E = self.router.hyp.exp_map(
-            self.router.W_E(g_p.float()))           # (B, hyp_dim)
-
-        # Routing of all patch tokens (for routing loss)
-        P_g    = self.router.hyp.exp_map(self.proto_g)  # (N_CLS, hyp_dim)
-        route_w, z_tokens = self.router.route(V.float(), P_g)  # (B, N, 3), (B, N, hyp_dim)
-
-        # Hierarchy-aware token update: V̂
-        V_hat = self.router.update_tokens(V.float(), g_E)  # (B, N, hidden)
-        V_hat = V_hat.to(dtype)
-
-        # ── 6. Product-hyperbolic CAS ─────────────────────────────────
-        (z_s, z_e, p_H_s, p_H_e, q_H,
-         d_s_tok, d_e_tok, d_se_tok,
-         P_s, P_e) = self.cas(h_s, h_e, h_g)
-
-        d_s_tok  = d_s_tok.to(dtype)
-        d_e_tok  = d_e_tok.to(dtype)
-        d_se_tok = d_se_tok.to(dtype)
-
-        # ── 7. ALM-II pass ────────────────────────────────────────────
-        ans = self.ans_token.to(dtype).expand(B, -1, -1)
-
-        alm2_in  = torch.cat([inst, V_hat, g_p_tok,
-                               d_s_tok, d_e_tok, d_se_tok, ans], dim=1)
-        alm2_out = self._alm_forward(alm2_in)      # (B, L2, hidden)
-
-        h_ans    = alm2_out[:, -1, :].float()      # (B, hidden) — ANSWER position
-
-        logit_s  = self.cls_s(h_ans)               # (B, N_CLS)
-        logit_e  = self.cls_e(h_ans)               # (B, N_CLS)
-
-        # ── 8. P_fake ─────────────────────────────────────────────────
-        p_s = F.softmax(logit_s, dim=-1)
-        p_e = F.softmax(logit_e, dim=-1)
-        p_fake = 1.0 - (1.0 - p_s[:, 2]) * (1.0 - p_e[:, 2])  # 1-(1-P_F_s)(1-P_F_e)
+        p_s    = F.one_hot(pred_s, 3).float()
+        p_e    = F.one_hot(pred_e, 3).float()
+        p_fake = 1.0 - (1.0 - p_s[:, 2]) * (1.0 - p_e[:, 2])
 
         return {
-            # Final predictions
             'logit_s':  logit_s,
             'logit_e':  logit_e,
             'p_fake':   p_fake,
-            # Hyperbolic component distributions
-            'p_H_s':    p_H_s,
-            'p_H_e':    p_H_e,
-            'q_H':      q_H,
-            # LM component distribution (factored)
-            'p_L_s':    p_s,
-            'p_L_e':    p_e,
-            # Routing outputs
-            'route_w':  route_w,
-            # Prototypes (for geometry loss)
-            'proto_s':  P_s,
-            'proto_e':  P_e,
+            'hyp_out':  hyp_out,
+            'h_s': h_s, 'h_e': h_e, 'h_g': h_g,
         }
